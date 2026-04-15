@@ -1,0 +1,35 @@
+{
+  "name": "tg-ai-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "openai": "^4.73.0",
+    "sharp": "^0.33.5",
+    "pdf-lib": "^1.17.1",
+    "archiver": "^7.0.1",
+    "extract-zip": "^2.0.1",
+    "csv-parse": "^5.6.0",
+    "csv-stringify": "^6.5.2",
+    "js-yaml": "^4.1.0",
+    "fast-xml-parser": "^4.5.0",
+    "qrcode": "^1.5.4",
+    "marked": "^15.0.0",
+    "sanitize-html": "^2.13.1",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0",
+    "@types/archiver": "^6.0.3",
+    "@types/js-yaml": "^4.0.9",
+    "@types/qrcode": "^1.5.5",
+    "@types/sanitize-html": "^2.13.0"
+  }
+}
