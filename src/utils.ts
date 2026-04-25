@@ -1,46 +1,67 @@
-import { execFile, exec as execCb } from 'child_process';
-import { promisify } from 'util';
-import { mkdtemp, rm, mkdir, stat, readdir } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join, extname, basename } from 'path';
+import { mkdtemp, rm, stat, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, extname, basename } from 'node:path';
 import type { ExecContext } from './actions/types.js';
-
-const execAsync = promisify(execCb);
+import { safeExec } from './security/safe-exec.js';
+import { logger } from './security/logger.js';
+import { sanitizeFilename } from './security/sanitize.js';
 
 export async function createWorkDir(): Promise<string> {
-  const dir = await mkdtemp(join(process.env.TEMP_DIR || tmpdir(), 'worker-'));
-  return dir;
+  const root = process.env.TEMP_DIR || tmpdir();
+  return mkdtemp(join(root, 'tgaiw-'));
 }
 
 export async function cleanupWorkDir(dir: string): Promise<void> {
+  if (!dir || !dir.includes('tgaiw-')) return;
   try {
     await rm(dir, { recursive: true, force: true });
-  } catch { /* ignore */ }
+  } catch (err) {
+    logger.debug('cleanupWorkDir failed', { dir, err });
+  }
 }
 
-export function createExecContext(workDir: string, inputFiles: string[]): ExecContext {
+export interface ExecContextOptions {
+  jobId: string;
+  abortSignal?: AbortSignal;
+}
+
+export function createExecContext(
+  workDir: string,
+  inputFiles: string[],
+  options: ExecContextOptions
+): ExecContext {
   let outputCounter = 0;
-  const runCmd = async (cmd: string, timeout = 300_000) => {
-    const { stdout, stderr } = await execAsync(cmd, {
+  const log = logger.child({ jobId: options.jobId });
+
+  const runArgs = async (
+    command: string,
+    args: string[],
+    runOpts: { timeout?: number; maxBuffer?: number } = {}
+  ): Promise<string> => {
+    if (options.abortSignal?.aborted) {
+      throw new Error('Job cancelled');
+    }
+    log.debug('exec', { command, args });
+    const { stdout, stderr } = await safeExec(command, args, {
       cwd: workDir,
-      timeout,
-      maxBuffer: 50 * 1024 * 1024,
-      shell: 'bash',
+      timeout: runOpts.timeout,
+      maxBuffer: runOpts.maxBuffer,
     });
-    if (stderr && !stdout) return stderr;
-    return stdout;
+    return stdout || stderr;
   };
+
   return {
     workDir,
     inputFiles,
+    jobId: options.jobId,
+    abortSignal: options.abortSignal,
     outputPath: (filename: string) => {
-      outputCounter++;
-      const name = `${outputCounter}_${filename}`;
-      return join(workDir, name);
+      outputCounter += 1;
+      const safe = sanitizeFilename(filename, `out-${outputCounter}`);
+      return join(workDir, `${outputCounter}_${safe}`);
     },
-    exec: runCmd,
-    run: runCmd,
-    log: (msg: string) => console.log(`[worker] ${msg}`),
+    runArgs,
+    log: (msg: string) => log.info(msg),
   };
 }
 
@@ -68,8 +89,4 @@ export async function listFiles(dir: string): Promise<string[]> {
   } catch {
     return [];
   }
-}
-
-export function escPath(p: string): string {
-  return p.replace(/\\/g, '/');
 }

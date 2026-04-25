@@ -1,5 +1,4 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
 import sharp from 'sharp';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';

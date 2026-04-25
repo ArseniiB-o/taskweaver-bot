@@ -1,5 +1,12 @@
 node_modules/
 dist/
+coverage/
 .env
+.env.local
+.env.*.local
 tmp/
 *.trf
+*.log
+.DS_Store
+.vscode/
+.idea/

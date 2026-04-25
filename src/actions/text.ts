@@ -1,7 +1,5 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
 import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 

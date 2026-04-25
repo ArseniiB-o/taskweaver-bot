@@ -1,5 +1,4 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
 
 // ---------------------------------------------------------------------------
 // Safe math expression parser — recursive descent, no code evaluation

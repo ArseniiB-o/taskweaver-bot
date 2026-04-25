@@ -5,31 +5,42 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests --ext .ts"
   },
   "dependencies": {
-    "telegraf": "^4.16.3",
-    "openai": "^4.73.0",
-    "sharp": "^0.33.5",
-    "pdf-lib": "^1.17.1",
     "archiver": "^7.0.1",
-    "extract-zip": "^2.0.1",
     "csv-parse": "^5.6.0",
     "csv-stringify": "^6.5.2",
-    "js-yaml": "^4.1.0",
+    "dotenv": "^16.4.5",
+    "extract-zip": "^2.0.1",
     "fast-xml-parser": "^4.5.0",
-    "qrcode": "^1.5.4",
+    "js-yaml": "^4.1.0",
     "marked": "^15.0.0",
+    "openai": "^4.73.0",
+    "pdf-lib": "^1.17.1",
+    "qrcode": "^1.5.4",
     "sanitize-html": "^2.13.1",
-    "dotenv": "^16.4.5"
+    "sharp": "^0.33.5",
+    "telegraf": "^4.16.3",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "tsx": "^4.19.0",
-    "@types/node": "^22.0.0",
     "@types/archiver": "^6.0.3",
     "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
     "@types/qrcode": "^1.5.5",
-    "@types/sanitize-html": "^2.13.0"
+    "@types/sanitize-html": "^2.13.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.0",
+    "@typescript-eslint/parser": "^8.59.0",
+    "@vitest/coverage-v8": "^4.1.5",
+    "eslint": "^10.2.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.5"
   }
 }

@@ -3,247 +3,327 @@ import { message } from 'telegraf/filters';
 import { createPlan } from './ai.js';
 import { executePlan } from './executor.js';
 import { cleanupWorkDir, fileExt } from './utils.js';
-import { writeFile, stat } from 'node:fs/promises';
+import { stat, unlink, mkdtemp } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createWriteStream } from 'node:fs';
-import { pipeline } from 'node:stream/promises';
+import { randomBytes } from 'node:crypto';
+import { loadConfig } from './config.js';
+import { RateLimiter } from './security/rate-limit.js';
+import { logger } from './security/logger.js';
+import { sanitizeFilename } from './security/sanitize.js';
 
-const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB || '50') || 50) * 1024 * 1024;
-const ALLOWED_USERS = (process.env.ALLOWED_USERS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean)
-  .map(Number);
+interface MessageFile {
+  fileId: string;
+  fileName: string;
+  size?: number;
+}
+
+interface RequestStats {
+  total: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+}
+
+const userStats = new Map<number, RequestStats>();
+
+function bumpStat(userId: number, key: keyof RequestStats): void {
+  const cur = userStats.get(userId) ?? { total: 0, succeeded: 0, failed: 0, cancelled: 0 };
+  cur[key] = (cur[key] ?? 0) + 1;
+  userStats.set(userId, cur);
+}
+
+function newJobId(): string {
+  return randomBytes(6).toString('hex');
+}
+
+async function streamDownloadToFile(
+  url: string,
+  dest: string,
+  maxBytes: number,
+  timeoutMs = 120_000
+): Promise<number> {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  let received = 0;
+  try {
+    const resp = await fetch(url, { signal: ac.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const declared = Number(resp.headers.get('content-length') ?? '0');
+    if (declared && declared > maxBytes) throw new Error(`File too large: ${declared} bytes > ${maxBytes}`);
+    if (!resp.body) throw new Error('Empty response body');
+
+    const stream = Readable.fromWeb(resp.body as any);
+    stream.on('data', (chunk: Buffer) => {
+      received += chunk.length;
+      if (received > maxBytes) stream.destroy(new Error(`File exceeds ${maxBytes} bytes`));
+    });
+    await pipeline(stream, createWriteStream(dest));
+    return received;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 export function createBot(): Telegraf {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) {
-    throw new Error('TELEGRAM_BOT_TOKEN is required');
-  }
+  const cfg = loadConfig();
+  const allowedSet = new Set(cfg.allowedUsers);
+  const limiter = new RateLimiter({
+    capacity: cfg.rateCapacity,
+    refillPerMinute: cfg.rateRefillPerMinute,
+    maxConcurrentPerUser: cfg.maxConcurrentPerUser,
+  });
 
-  const bot = new Telegraf(token);
+  const bot = new Telegraf(cfg.telegramToken, { handlerTimeout: 90_000 });
 
-  // Auth middleware
   bot.use(async (ctx, next) => {
-    if (ALLOWED_USERS.length > 0) {
-      const userId = ctx.from?.id;
-      if (!userId || !ALLOWED_USERS.includes(userId)) {
-        await ctx.reply('⛔ Нет доступа.');
+    const userId = ctx.from?.id;
+    if (allowedSet.size > 0) {
+      if (!userId || !allowedSet.has(userId)) {
+        logger.warn('rejected: user not allowed', { userId });
+        await ctx.reply('⛔ Нет доступа.').catch(() => {});
         return;
       }
+    } else if (userId) {
+      logger.warn('public mode: ALLOWED_USERS is empty — anyone can use the bot', { userId });
     }
     return next();
   });
 
   bot.command('start', async (ctx) => {
     await ctx.reply(
-      '🤖 AI Worker Bot\n\n' +
-      'Отправь мне файл(ы) с описанием задачи, или просто текстовый запрос.\n\n' +
+      '🤖 TaskWeaver Bot\n\n' +
+      'Отправь файл(ы) с описанием задачи или просто текст.\n\n' +
+      'Команды:\n' +
+      '• /actions — все действия\n' +
+      '• /stats — твоя статистика\n' +
+      '• /cancel — отменить активную задачу\n\n' +
       'Примеры:\n' +
       '• Конвертируй в mp3\n' +
       '• Сожми видео\n' +
-      '• Объедини эти PDF\n' +
-      '• Сгенерируй QR-код: https://example.com\n' +
-      '• Посчитай 2^32\n' +
-      '• Сгенерируй пароль 20 символов\n\n' +
-      '/actions — список всех действий'
+      '• Сгенерируй QR: https://example.com\n' +
+      '• Сколько 2^32?'
     );
   });
 
   bot.command('actions', async (ctx) => {
     const { buildActionCatalog } = await import('./actions/registry.js');
     const catalog = buildActionCatalog();
-
-    // Split into chunks if too long for Telegram
-    const chunks = splitMessage(catalog, 4000);
-    for (const chunk of chunks) {
-      await ctx.reply(chunk);
+    for (const chunk of splitMessage(catalog, 4000)) {
+      await ctx.reply(chunk).catch(() => {});
     }
   });
 
-  // Handle messages with files
-  bot.on(message('document'), handleMessage);
-  bot.on(message('photo'), handleMessage);
-  bot.on(message('video'), handleMessage);
-  bot.on(message('audio'), handleMessage);
-  bot.on(message('voice'), handleMessage);
-  bot.on(message('video_note'), handleMessage);
-  bot.on(message('sticker'), handleMessage);
-  bot.on(message('text'), handleMessage);
+  bot.command('stats', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const stats = userStats.get(userId) ?? { total: 0, succeeded: 0, failed: 0, cancelled: 0 };
+    const status = limiter.getStatus(userId);
+    await ctx.reply(
+      `📊 Stats\n` +
+      `Total:     ${stats.total}\n` +
+      `OK:        ${stats.succeeded}\n` +
+      `Failed:    ${stats.failed}\n` +
+      `Cancelled: ${stats.cancelled}\n\n` +
+      `Tokens:    ${status.tokens}\n` +
+      `Active:    ${status.activeJobs}\n` +
+      `In flight: ${status.inFlight}`
+    );
+  });
+
+  bot.command('cancel', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const cancelled = limiter.cancelJobs(userId);
+    await ctx.reply(cancelled > 0 ? `🛑 Отменено задач: ${cancelled}` : 'Активных задач нет.');
+  });
+
+  const handler = async (ctx: any) => handleMessage(ctx, limiter);
+  bot.on(message('document'), handler);
+  bot.on(message('photo'), handler);
+  bot.on(message('video'), handler);
+  bot.on(message('audio'), handler);
+  bot.on(message('voice'), handler);
+  bot.on(message('video_note'), handler);
+  bot.on(message('sticker'), handler);
+  bot.on(message('text'), handler);
+
+  bot.catch((err) => {
+    logger.error('Bot error', { err });
+  });
 
   return bot;
 }
 
-async function handleMessage(ctx: any): Promise<void> {
-  const userText = ctx.message?.text || ctx.message?.caption || '';
-  const files: Array<{ fileId: string; fileName: string }> = [];
+async function handleMessage(ctx: any, limiter: RateLimiter): Promise<void> {
+  const userId = ctx.from?.id as number | undefined;
+  if (!userId) return;
 
-  // Collect file IDs from message
-  if (ctx.message?.document) {
-    files.push({
-      fileId: ctx.message.document.file_id,
-      fileName: ctx.message.document.file_name || 'document',
-    });
-  }
+  const userText = String(ctx.message?.text ?? ctx.message?.caption ?? '').slice(0, 4000);
+  const files: MessageFile[] = [];
+
+  const collect = (fileId: string, fileName: string, size?: number) => {
+    files.push({ fileId, fileName, size });
+  };
+
+  if (ctx.message?.document) collect(ctx.message.document.file_id, ctx.message.document.file_name || 'document', ctx.message.document.file_size);
   if (ctx.message?.photo) {
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
-    files.push({ fileId: photo.file_id, fileName: 'photo.jpg' });
+    collect(photo.file_id, 'photo.jpg', photo.file_size);
   }
-  if (ctx.message?.video) {
-    files.push({
-      fileId: ctx.message.video.file_id,
-      fileName: ctx.message.video.file_name || 'video.mp4',
-    });
-  }
-  if (ctx.message?.audio) {
-    files.push({
-      fileId: ctx.message.audio.file_id,
-      fileName: ctx.message.audio.file_name || 'audio.mp3',
-    });
-  }
-  if (ctx.message?.voice) {
-    files.push({ fileId: ctx.message.voice.file_id, fileName: 'voice.ogg' });
-  }
-  if (ctx.message?.video_note) {
-    files.push({ fileId: ctx.message.video_note.file_id, fileName: 'videonote.mp4' });
-  }
-  if (ctx.message?.sticker?.file_id) {
-    files.push({ fileId: ctx.message.sticker.file_id, fileName: 'sticker.webp' });
-  }
+  if (ctx.message?.video) collect(ctx.message.video.file_id, ctx.message.video.file_name || 'video.mp4', ctx.message.video.file_size);
+  if (ctx.message?.audio) collect(ctx.message.audio.file_id, ctx.message.audio.file_name || 'audio.mp3', ctx.message.audio.file_size);
+  if (ctx.message?.voice) collect(ctx.message.voice.file_id, 'voice.ogg', ctx.message.voice.file_size);
+  if (ctx.message?.video_note) collect(ctx.message.video_note.file_id, 'videonote.mp4', ctx.message.video_note.file_size);
+  if (ctx.message?.sticker?.file_id) collect(ctx.message.sticker.file_id, 'sticker.webp', ctx.message.sticker.file_size);
 
-  // If no text and no files, ignore
   if (!userText && files.length === 0) return;
-
-  // If only file without text, ask what to do
   if (!userText && files.length > 0) {
-    await ctx.reply('📎 Файл получен. Что с ним сделать? Напиши задачу.');
+    await ctx.reply('📎 Файл получен. Что с ним сделать? Напиши задачу.').catch(() => {});
     return;
   }
 
-  // Check for pending files in media group
-  const pendingFiles = (ctx as any).__pendingFiles || [];
+  const cfg = loadConfig();
+  if (files.length > cfg.maxTotalFilesPerRequest) {
+    await ctx.reply(`⚠️ Слишком много файлов (макс ${cfg.maxTotalFilesPerRequest}).`).catch(() => {});
+    return;
+  }
+
+  const acquire = limiter.tryAcquire(userId);
+  if (!acquire.ok) {
+    if (acquire.reason === 'too_many_concurrent') {
+      await ctx.reply('⏳ У тебя уже выполняется задача. Жди завершения или используй /cancel.').catch(() => {});
+    } else {
+      await ctx.reply(`⏳ Лимит запросов. Повтори через ${acquire.retryAfterSec ?? 60}с.`).catch(() => {});
+    }
+    return;
+  }
+
+  const jobId = newJobId();
+  const log = logger.child({ jobId, userId });
+  const ac = new AbortController();
+  limiter.registerJob(userId, jobId, () => ac.abort());
+  bumpStat(userId, 'total');
+
+  let downloadDir = '';
+  let workDirToCleanup = '';
 
   try {
-    await ctx.reply('🔄 Анализирую запрос...');
+    await ctx.reply('🔄 Анализирую запрос...').catch(() => {});
 
-    // Download files
+    downloadDir = await mkdtemp(join(tmpdir(), 'tgaiw-dl-'));
+
     const downloadedFiles: string[] = [];
     const fileDescriptions: string[] = [];
 
     for (const f of files) {
       try {
         const fileLink = await ctx.telegram.getFileLink(f.fileId);
-        const tmpPath = join(tmpdir(), `tgdl_${Date.now()}_${f.fileName}`);
-
-        const response = await fetch(fileLink.href);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.length > MAX_FILE_SIZE) {
-          await ctx.reply(`⚠️ Файл ${f.fileName} слишком большой (макс ${MAX_FILE_SIZE / 1024 / 1024}MB)`);
-          continue;
-        }
-
-        await writeFile(tmpPath, buffer);
+        const safeName = sanitizeFilename(f.fileName, 'file');
+        const tmpPath = join(downloadDir, `${downloadedFiles.length}_${safeName}`);
+        const size = await streamDownloadToFile(fileLink.href, tmpPath, cfg.maxFileSizeBytes, 120_000);
         downloadedFiles.push(tmpPath);
-        fileDescriptions.push(`${f.fileName} (${formatSize(buffer.length)})`);
-      } catch (err: any) {
-        await ctx.reply(`⚠️ Не удалось скачать ${f.fileName}: ${err.message}`);
+        fileDescriptions.push(`${safeName} (${formatSize(size)})`);
+      } catch (err) {
+        log.warn('download failed', { fileName: f.fileName, err });
+        await ctx.reply(`⚠️ Не удалось скачать ${f.fileName}: ${(err as Error).message}`).catch(() => {});
       }
     }
 
-    // Create AI plan
     const plan = await createPlan(userText, fileDescriptions);
 
     if (plan.steps.length === 0) {
-      await ctx.reply(`ℹ️ ${plan.message}`);
+      await ctx.reply(`ℹ️ ${plan.message}`).catch(() => {});
+      bumpStat(userId, 'failed');
       return;
     }
 
-    await ctx.reply(`📋 План: ${plan.message}\n⏳ Выполняю ${plan.steps.length} шаг(ов)...`);
+    await ctx.reply(`📋 ${plan.message}\n⏳ Шагов: ${plan.steps.length} (jobId: ${jobId})`).catch(() => {});
 
-    // Execute plan
-    const result = await executePlan(plan, downloadedFiles, async (step, total, name) => {
-      if (total > 1) {
-        await ctx.reply(`⚙️ Шаг ${step}/${total}: ${name}...`).catch(() => {});
-      }
+    const result = await executePlan(plan, downloadedFiles, {
+      jobId,
+      abortSignal: ac.signal,
+      onProgress: async (step, total, name) => {
+        if (total > 1) await ctx.reply(`⚙️ ${step}/${total}: ${name}...`).catch(() => {});
+      },
     });
 
-    // Send results
+    workDirToCleanup = result.workDir;
+
     if (!result.success) {
-      await ctx.reply(`❌ Ошибка: ${result.error}`);
-    } else {
-      // Send text results
-      if (result.text) {
-        const chunks = splitMessage(result.text, 4000);
-        for (const chunk of chunks) {
-          await ctx.reply(chunk);
-        }
-      }
+      bumpStat(userId, result.cancelled ? 'cancelled' : 'failed');
+      await ctx.reply(`❌ ${result.cancelled ? 'Отменено' : 'Ошибка'}: ${result.error}`).catch(() => {});
+      return;
+    }
 
-      // Send file results
-      for (const filePath of result.files) {
-        try {
-          const fileStat = await stat(filePath);
-          if (fileStat.size > 50 * 1024 * 1024) {
-            await ctx.reply(`⚠️ Файл слишком большой для отправки через Telegram (${formatSize(fileStat.size)})`);
-            continue;
-          }
+    bumpStat(userId, 'succeeded');
 
-          const ext = fileExt(filePath);
-          const source = { source: filePath };
-
-          if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext) && fileStat.size < 10 * 1024 * 1024) {
-            await ctx.replyWithPhoto(source);
-          } else if (['mp4', 'mov', 'avi'].includes(ext) && fileStat.size < 50 * 1024 * 1024) {
-            await ctx.replyWithVideo(source);
-          } else if (['mp3', 'ogg', 'wav', 'flac', 'aac', 'm4a'].includes(ext)) {
-            await ctx.replyWithAudio(source);
-          } else if (ext === 'ogg') {
-            await ctx.replyWithVoice(source);
-          } else {
-            await ctx.replyWithDocument(source);
-          }
-        } catch (err: any) {
-          await ctx.reply(`⚠️ Не удалось отправить файл: ${err.message}`);
-        }
-      }
-
-      if (!result.text && result.files.length === 0) {
-        await ctx.reply('✅ Готово!');
+    if (result.text) {
+      for (const chunk of splitMessage(result.text, 4000)) {
+        await ctx.reply(chunk).catch(() => {});
       }
     }
 
-    // Cleanup
-    await cleanupWorkDir(result.workDir);
-  } catch (err: any) {
-    console.error('Handler error:', err);
-    await ctx.reply(`❌ Ошибка: ${err.message}`);
+    for (const filePath of result.files) {
+      try {
+        const fileStat = await stat(filePath);
+        if (fileStat.size > 50 * 1024 * 1024) {
+          await ctx.reply(`⚠️ Файл слишком большой (${formatSize(fileStat.size)}).`).catch(() => {});
+          continue;
+        }
+        const ext = fileExt(filePath);
+        const source = { source: filePath };
+        if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext) && fileStat.size < 10 * 1024 * 1024) {
+          await ctx.replyWithPhoto(source).catch(() => ctx.replyWithDocument(source));
+        } else if (['mp4', 'mov'].includes(ext) && fileStat.size < 50 * 1024 * 1024) {
+          await ctx.replyWithVideo(source).catch(() => ctx.replyWithDocument(source));
+        } else if (ext === 'ogg') {
+          await ctx.replyWithVoice(source).catch(() => ctx.replyWithDocument(source));
+        } else if (['mp3', 'wav', 'flac', 'aac', 'm4a'].includes(ext)) {
+          await ctx.replyWithAudio(source).catch(() => ctx.replyWithDocument(source));
+        } else {
+          await ctx.replyWithDocument(source).catch(() => {});
+        }
+      } catch (err) {
+        log.warn('send file failed', { filePath, err });
+      }
+    }
+
+    if (!result.text && result.files.length === 0) {
+      await ctx.reply('✅ Готово!').catch(() => {});
+    }
+  } catch (err) {
+    log.error('handler crashed', { err });
+    bumpStat(userId, 'failed');
+    await ctx.reply(`❌ Внутренняя ошибка.`).catch(() => {});
+  } finally {
+    limiter.unregisterJob(userId, jobId);
+    limiter.release(userId);
+    if (workDirToCleanup) await cleanupWorkDir(workDirToCleanup);
+    if (downloadDir) {
+      const { rm } = await import('node:fs/promises');
+      await rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
 function splitMessage(text: string, maxLen: number): string[] {
   if (text.length <= maxLen) return [text];
-
   const chunks: string[] = [];
   let remaining = text;
-
   while (remaining.length > 0) {
     if (remaining.length <= maxLen) {
       chunks.push(remaining);
       break;
     }
-
     let splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt === -1 || splitAt < maxLen / 2) {
-      splitAt = maxLen;
-    }
-
+    if (splitAt === -1 || splitAt < maxLen / 2) splitAt = maxLen;
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt);
   }
-
   return chunks;
 }
 

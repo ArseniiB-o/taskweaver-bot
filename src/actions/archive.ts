@@ -1,10 +1,14 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
 import archiver from 'archiver';
 import extractZip from 'extract-zip';
-import { createWriteStream } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { createWriteStream, createReadStream } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { createGzip, createGunzip } from 'node:zlib';
+import { sanitizeFilename } from '../security/sanitize.js';
+
+const SAFE_OUTPUT_NAME = (raw: unknown, fallback: string): string =>
+  sanitizeFilename(String(raw ?? fallback), fallback);
 
 export const archiveActions: Action[] = [
   {
@@ -17,27 +21,21 @@ export const archiveActions: Action[] = [
     ],
     execute: async (params, ctx) => {
       try {
-        const outputName = (params.output_name as string) || 'archive.zip';
-        const outputFile = ctx.outputPath(outputName);
-
+        const outFile = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_name, 'archive.zip'));
         await new Promise<void>((resolve, reject) => {
-          const output = createWriteStream(outputFile);
+          const out = createWriteStream(outFile);
           const archive = archiver('zip', { zlib: { level: 9 } });
-
-          output.on('close', resolve);
+          out.on('close', resolve);
           archive.on('error', reject);
-          archive.pipe(output);
-
+          archive.pipe(out);
           for (const filePath of ctx.inputFiles) {
-            const filename = filePath.split(/[\\/]/).pop() ?? filePath;
+            const filename = filePath.split(/[\\/]/).pop() ?? 'file';
             archive.file(filePath, { name: filename });
           }
-
           archive.finalize();
         });
-
-        ctx.log(`Created ZIP: ${outputFile}`);
-        return { files: [outputFile] };
+        ctx.log(`Created ZIP: ${outFile}`);
+        return { files: [outFile] };
       } catch (err) {
         return { error: `zip_create failed: ${(err as Error).message}` };
       }
@@ -55,10 +53,11 @@ export const archiveActions: Action[] = [
     execute: async (params, ctx) => {
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
-        const outputDir = ctx.outputPath((params.output_dir as string) || 'extracted');
-        await extractZip(ctx.inputFiles[0], { dir: outputDir });
-        ctx.log(`Extracted ZIP to: ${outputDir}`);
-        return { files: [outputDir] };
+        const outDir = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_dir, 'extracted'));
+        await mkdir(outDir, { recursive: true });
+        await extractZip(ctx.inputFiles[0], { dir: outDir });
+        ctx.log(`Extracted ZIP to: ${outDir}`);
+        return { files: [outDir] };
       } catch (err) {
         return { error: `zip_extract failed: ${(err as Error).message}` };
       }
@@ -75,27 +74,21 @@ export const archiveActions: Action[] = [
     ],
     execute: async (params, ctx) => {
       try {
-        const outputName = (params.output_name as string) || 'archive.tar.gz';
-        const outputFile = ctx.outputPath(outputName);
-
+        const outFile = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_name, 'archive.tar.gz'));
         await new Promise<void>((resolve, reject) => {
-          const output = createWriteStream(outputFile);
+          const out = createWriteStream(outFile);
           const archive = archiver('tar', { gzip: true, gzipOptions: { level: 9 } });
-
-          output.on('close', resolve);
+          out.on('close', resolve);
           archive.on('error', reject);
-          archive.pipe(output);
-
+          archive.pipe(out);
           for (const filePath of ctx.inputFiles) {
-            const filename = filePath.split(/[\\/]/).pop() ?? filePath;
+            const filename = filePath.split(/[\\/]/).pop() ?? 'file';
             archive.file(filePath, { name: filename });
           }
-
           archive.finalize();
         });
-
-        ctx.log(`Created TAR.GZ: ${outputFile}`);
-        return { files: [outputFile] };
+        ctx.log(`Created TAR.GZ: ${outFile}`);
+        return { files: [outFile] };
       } catch (err) {
         return { error: `tar_create failed: ${(err as Error).message}` };
       }
@@ -106,19 +99,18 @@ export const archiveActions: Action[] = [
     id: 'archive.tar_extract',
     category: 'archive',
     name: 'Extract TAR/TAR.GZ',
-    description: 'Extract a TAR or TAR.GZ archive',
+    description: 'Extract a TAR or TAR.GZ archive (requires tar CLI)',
     params: [
       { name: 'output_dir', type: 'string', required: false, description: 'Output directory name', default: 'extracted' },
     ],
     execute: async (params, ctx) => {
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
-        const outputDir = ctx.outputPath((params.output_dir as string) || 'extracted');
-        const src = escPath(ctx.inputFiles[0]);
-        const dest = escPath(outputDir);
-        await ctx.exec(`mkdir -p ${dest} && tar -xf ${src} -C ${dest}`);
-        ctx.log(`Extracted TAR to: ${outputDir}`);
-        return { files: [outputDir] };
+        const outDir = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_dir, 'extracted'));
+        await mkdir(outDir, { recursive: true });
+        await ctx.runArgs('tar', ['-xf', ctx.inputFiles[0], '-C', outDir]);
+        ctx.log(`Extracted TAR to: ${outDir}`);
+        return { files: [outDir] };
       } catch (err) {
         return { error: `tar_extract failed: ${(err as Error).message}` };
       }
@@ -129,7 +121,7 @@ export const archiveActions: Action[] = [
     id: 'archive.gzip',
     category: 'archive',
     name: 'Gzip Compress',
-    description: 'Compress a single file using gzip',
+    description: 'Compress a single file using gzip (Node.js zlib)',
     params: [
       { name: 'output_name', type: 'string', required: false, description: 'Output filename (default: input + .gz)' },
     ],
@@ -137,13 +129,9 @@ export const archiveActions: Action[] = [
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
         const baseName = ctx.inputFiles[0].split(/[\\/]/).pop() ?? 'file';
-        const outputName = (params.output_name as string) || `${baseName}.gz`;
-        const outputFile = ctx.outputPath(outputName);
-        const src = escPath(ctx.inputFiles[0]);
-        const dest = escPath(outputFile);
-        await ctx.exec(`gzip -c ${src} > ${dest}`);
-        ctx.log(`Compressed: ${outputFile}`);
-        return { files: [outputFile] };
+        const outFile = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_name, `${baseName}.gz`));
+        await pipeline(createReadStream(ctx.inputFiles[0]), createGzip({ level: 9 }), createWriteStream(outFile));
+        return { files: [outFile] };
       } catch (err) {
         return { error: `gzip failed: ${(err as Error).message}` };
       }
@@ -154,7 +142,7 @@ export const archiveActions: Action[] = [
     id: 'archive.gunzip',
     category: 'archive',
     name: 'Gzip Decompress',
-    description: 'Decompress a gzip-compressed file',
+    description: 'Decompress a gzip-compressed file (Node.js zlib)',
     params: [
       { name: 'output_name', type: 'string', required: false, description: 'Output filename (default: filename without .gz)' },
     ],
@@ -162,13 +150,9 @@ export const archiveActions: Action[] = [
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
         const baseName = (ctx.inputFiles[0].split(/[\\/]/).pop() ?? 'file').replace(/\.gz$/i, '');
-        const outputName = (params.output_name as string) || baseName;
-        const outputFile = ctx.outputPath(outputName);
-        const src = escPath(ctx.inputFiles[0]);
-        const dest = escPath(outputFile);
-        await ctx.exec(`gunzip -c ${src} > ${dest}`);
-        ctx.log(`Decompressed: ${outputFile}`);
-        return { files: [outputFile] };
+        const outFile = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_name, baseName));
+        await pipeline(createReadStream(ctx.inputFiles[0]), createGunzip(), createWriteStream(outFile));
+        return { files: [outFile] };
       } catch (err) {
         return { error: `gunzip failed: ${(err as Error).message}` };
       }
@@ -181,26 +165,18 @@ export const archiveActions: Action[] = [
     name: 'List Archive Contents',
     description: 'List the contents of a ZIP or TAR archive',
     params: [],
-    execute: async (params, ctx) => {
+    execute: async (_params, ctx) => {
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
-        const lowerName = ctx.inputFiles[0].toLowerCase();
-        const src = escPath(ctx.inputFiles[0]);
-
+        const lower = ctx.inputFiles[0].toLowerCase();
         let result: string;
-        if (lowerName.endsWith('.zip')) {
-          result = await ctx.exec(`unzip -l ${src}`);
-        } else if (
-          lowerName.endsWith('.tar') ||
-          lowerName.endsWith('.tar.gz') ||
-          lowerName.endsWith('.tgz') ||
-          lowerName.endsWith('.tar.bz2')
-        ) {
-          result = await ctx.exec(`tar -tf ${src}`);
+        if (lower.endsWith('.zip')) {
+          result = await ctx.runArgs('unzip', ['-l', ctx.inputFiles[0]]);
+        } else if (lower.endsWith('.tar') || lower.endsWith('.tar.gz') || lower.endsWith('.tgz') || lower.endsWith('.tar.bz2')) {
+          result = await ctx.runArgs('tar', ['-tf', ctx.inputFiles[0]]);
         } else {
           return { error: 'Unsupported archive format. Supported: .zip, .tar, .tar.gz, .tgz, .tar.bz2' };
         }
-
         return { text: result };
       } catch (err) {
         return { error: `archive.list failed: ${(err as Error).message}` };
@@ -219,15 +195,11 @@ export const archiveActions: Action[] = [
     ],
     execute: async (params, ctx) => {
       try {
-        const outputName = (params.output_name as string) || 'archive.7z';
-        const outputFile = ctx.outputPath(outputName);
-        const dest = escPath(outputFile);
-        const level = (params.compression as number) ?? 5;
-        const fileList = ctx.inputFiles.map(escPath).join(' ');
-
-        const result = await ctx.exec(`7z a -mx=${level} ${dest} ${fileList}`);
+        const outFile = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_name, 'archive.7z'));
+        const level = Math.min(9, Math.max(0, Math.trunc(Number(params.compression ?? 5)) || 5));
+        const result = await ctx.runArgs('7z', ['a', `-mx=${level}`, outFile, ...ctx.inputFiles]);
         ctx.log(result);
-        return { files: [outputFile] };
+        return { files: [outFile] };
       } catch (err) {
         return { error: `7z_create failed: ${(err as Error).message}` };
       }
@@ -245,13 +217,11 @@ export const archiveActions: Action[] = [
     execute: async (params, ctx) => {
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
-        const outputDir = ctx.outputPath((params.output_dir as string) || 'extracted');
-        const src = escPath(ctx.inputFiles[0]);
-        const dest = escPath(outputDir);
-
-        const result = await ctx.exec(`7z x ${src} -o${dest} -y`);
+        const outDir = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_dir, 'extracted'));
+        await mkdir(outDir, { recursive: true });
+        const result = await ctx.runArgs('7z', ['x', ctx.inputFiles[0], `-o${outDir}`, '-y']);
         ctx.log(result);
-        return { files: [outputDir] };
+        return { files: [outDir] };
       } catch (err) {
         return { error: `7z_extract failed: ${(err as Error).message}` };
       }
@@ -269,13 +239,11 @@ export const archiveActions: Action[] = [
     execute: async (params, ctx) => {
       try {
         if (!ctx.inputFiles[0]) return { error: 'No input file provided' };
-        const outputDir = ctx.outputPath((params.output_dir as string) || 'extracted');
-        const src = escPath(ctx.inputFiles[0]);
-        const dest = escPath(outputDir);
-
-        const result = await ctx.exec(`unrar x -y ${src} ${dest}/`);
+        const outDir = ctx.outputPath(SAFE_OUTPUT_NAME(params.output_dir, 'extracted'));
+        await mkdir(outDir, { recursive: true });
+        const result = await ctx.runArgs('unrar', ['x', '-y', ctx.inputFiles[0], `${outDir}/`]);
         ctx.log(result);
-        return { files: [outputDir] };
+        return { files: [outDir] };
       } catch (err) {
         return { error: `rar_extract failed: ${(err as Error).message}` };
       }

@@ -1,5 +1,4 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, extname } from 'node:path';
 import { PDFDocument, degrees } from 'pdf-lib';
@@ -103,7 +102,7 @@ export const documentActions: Action[] = [
         if (!input) return { error: 'No input PDF provided' };
         const outPrefix = ctx.outputPath('page');
         try {
-          await ctx.exec(`pdftoppm -png "${escPath(input)}" "${escPath(outPrefix)}"`, 120_000);
+          await ctx.runArgs('pdftoppm', ['-png', input, outPrefix], { timeout: 120_000 });
         } catch {
           return { error: 'pdftoppm is not available on this system. Install poppler-utils to use this action.' };
         }
@@ -167,12 +166,16 @@ export const documentActions: Action[] = [
       try {
         const input = ctx.inputFiles[0];
         if (!input) return { error: 'No input PDF provided' };
-        const password = String(params.password).replace(/'/g, "'\\''");
+        const password = String(params.password ?? '');
+        if (password.length < 1 || password.length > 256) {
+          return { error: 'Password must be 1-256 characters' };
+        }
         const outPath = ctx.outputPath('protected.pdf');
         try {
-          await ctx.exec(
-            `qpdf --encrypt "${password}" "${password}" 256 -- "${escPath(input)}" "${escPath(outPath)}"`,
-            60_000
+          await ctx.runArgs(
+            'qpdf',
+            ['--encrypt', password, password, '256', '--', input, outPath],
+            { timeout: 60_000 }
           );
         } catch {
           return { error: 'qpdf is not available on this system. Install qpdf to use this action.' };
@@ -196,7 +199,7 @@ export const documentActions: Action[] = [
         if (!input) return { error: 'No input PDF provided' };
         let text: string;
         try {
-          text = await ctx.exec(`pdftotext "${escPath(input)}" -`, 60_000);
+          text = await ctx.runArgs('pdftotext', [input, '-'], { timeout: 60_000 });
         } catch {
           return { error: 'pdftotext is not available. Install poppler-utils to use this action.' };
         }
@@ -301,7 +304,7 @@ export const documentActions: Action[] = [
         if (!input) return { error: 'No input HTML file provided' };
         const outPath = ctx.outputPath('output.pdf');
         try {
-          await ctx.exec(`wkhtmltopdf "${escPath(input)}" "${escPath(outPath)}"`, 120_000);
+          await ctx.runArgs('wkhtmltopdf', [input, outPath], { timeout: 120_000 });
         } catch {
           return { error: 'wkhtmltopdf is not available. Install wkhtmltopdf to use this action.' };
         }
@@ -572,10 +575,9 @@ export const documentActions: Action[] = [
         const [a, b] = ctx.inputFiles;
         let diff: string;
         try {
-          diff = await ctx.exec(`diff "${escPath(a)}" "${escPath(b)}"`, 30_000);
-        } catch (execErr: any) {
-          // diff exits with code 1 when files differ — that output is still useful
-          diff = execErr.message ?? String(execErr);
+          diff = await ctx.runArgs('diff', [a, b], { timeout: 30_000 });
+        } catch (execErr) {
+          diff = (execErr as Error).message ?? String(execErr);
         }
         return { text: diff || 'Files are identical' };
       } catch (e: any) {

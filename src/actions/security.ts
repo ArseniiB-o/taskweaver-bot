@@ -1,24 +1,21 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
-import { readFile } from 'node:fs/promises';
-import { createHash, randomBytes, createCipheriv, createDecipheriv, scryptSync } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes, createCipheriv, createDecipheriv, scryptSync, generateKeyPair } from 'node:crypto';
+import { promisify } from 'node:util';
 import sanitizeHtml from 'sanitize-html';
+import { assertValidDomain } from '../security/sanitize.js';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const generateKeyPairAsync = promisify(generateKeyPair);
 
-/** Derive key (32 B) and IV (16 B) from password + salt using scrypt. */
 function deriveKeyAndIv(password: string, salt: Buffer): { key: Buffer; iv: Buffer } {
   const derived = scryptSync(password, salt, 48) as Buffer;
   return { key: derived.subarray(0, 32), iv: derived.subarray(32, 48) };
 }
 
-/** Simple password strength scorer. Returns score 0-5 and feedback strings. */
 function scorePassword(password: string): { score: number; feedback: string[] } {
   const feedback: string[] = [];
   let score = 0;
-  if (password.length >= 8)  score += 1; else feedback.push('Use at least 8 characters');
+  if (password.length >= 8) score += 1; else feedback.push('Use at least 8 characters');
   if (password.length >= 12) score += 1; else feedback.push('12+ characters recommended');
   if (password.length >= 16) score += 1;
   if (/[a-z]/.test(password)) score += 1; else feedback.push('Add lowercase letters');
@@ -31,14 +28,14 @@ function scorePassword(password: string): { score: number; feedback: string[] } 
   return { score: Math.max(0, Math.min(score, 5)), feedback };
 }
 
-/** Lightweight email format check. */
 function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
 }
 
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
+function pickIndex(byteVal: number, max: number): number {
+  return byteVal % max;
+}
+
 export const securityActions: Action[] = [
   {
     id: 'security.password_generate',
@@ -52,10 +49,9 @@ export const securityActions: Action[] = [
       { name: 'numbers',   type: 'boolean', required: false, description: 'Include digits', default: true },
       { name: 'symbols',   type: 'boolean', required: false, description: 'Include symbols', default: true },
     ],
-    async execute(params, _ctx) {
+    async execute(params) {
       try {
-        const length = Math.min((params.length as number) ?? 16, 256);
-        if (length < 4) return { error: 'Password length must be at least 4' };
+        const length = Math.min(Math.max(Number(params.length ?? 16) || 16, 4), 256);
         const useUpper   = params.uppercase !== false;
         const useLower   = params.lowercase !== false;
         const useNumbers = params.numbers   !== false;
@@ -73,25 +69,30 @@ export const securityActions: Action[] = [
         if (useSymbols) pool += symbols;
         if (!pool) return { error: 'At least one character type must be selected' };
 
-        const bytes = randomBytes(length * 2 + 8);
         const chars: string[] = [];
-        let idx = 0;
+        const required: string[] = [];
+        if (useUpper)   required.push(upper);
+        if (useLower)   required.push(lower);
+        if (useNumbers) required.push(digits);
+        if (useSymbols) required.push(symbols);
 
-        if (useUpper)   chars.push(upper[bytes[idx++] % upper.length]);
-        if (useLower)   chars.push(lower[bytes[idx++] % lower.length]);
-        if (useNumbers) chars.push(digits[bytes[idx++] % digits.length]);
-        if (useSymbols) chars.push(symbols[bytes[idx++] % symbols.length]);
-
-        while (chars.length < length) chars.push(pool[bytes[idx++ % bytes.length] % pool.length]);
-
+        for (const set of required) {
+          const buf = randomBytes(1);
+          chars.push(set[pickIndex(buf[0], set.length)]);
+        }
+        while (chars.length < length) {
+          const buf = randomBytes(1);
+          chars.push(pool[pickIndex(buf[0], pool.length)]);
+        }
+        // Fisher-Yates with crypto random
         const shuffleBytes = randomBytes(chars.length);
         for (let i = chars.length - 1; i > 0; i--) {
           const j = shuffleBytes[i] % (i + 1);
           [chars[i], chars[j]] = [chars[j], chars[i]];
         }
         return { text: chars.join('') };
-      } catch (err: any) {
-        return { error: 'Password generation failed: ' + err.message };
+      } catch (err) {
+        return { error: `Password generation failed: ${(err as Error).message}` };
       }
     },
   },
@@ -104,24 +105,22 @@ export const securityActions: Action[] = [
     params: [
       { name: 'password', type: 'string', required: true, description: 'Password to analyse' },
     ],
-    async execute(params, _ctx) {
+    async execute(params) {
       try {
-        const password = params.password as string;
+        const password = String(params.password ?? '');
         const { score, feedback } = scorePassword(password);
         const levels = ['Very Weak', 'Weak', 'Fair', 'Good', 'Strong', 'Very Strong'];
         const label = levels[score] ?? 'Unknown';
         const bar = '='.repeat(score) + ' '.repeat(Math.max(0, 5 - score));
         const lines = [
-          'Strength: ' + label + ' (' + score + '/5)',
-          'Score:    [' + bar + ']',
-          'Length:   ' + password.length + ' chars',
+          `Strength: ${label} (${score}/5)`,
+          `Score:    [${bar}]`,
+          `Length:   ${password.length} chars`,
         ];
-        if (feedback.length > 0) {
-          lines.push('\nSuggestions:\n' + feedback.map((f) => '  - ' + f).join('\n'));
-        }
+        if (feedback.length > 0) lines.push('\nSuggestions:\n' + feedback.map(f => `  - ${f}`).join('\n'));
         return { text: lines.join('\n') };
-      } catch (err: any) {
-        return { error: 'Password strength check failed: ' + err.message };
+      } catch (err) {
+        return { error: `Password strength check failed: ${(err as Error).message}` };
       }
     },
   },
@@ -135,19 +134,18 @@ export const securityActions: Action[] = [
       { name: 'text',     type: 'string', required: true, description: 'Plaintext to encrypt' },
       { name: 'password', type: 'string', required: true, description: 'Encryption password' },
     ],
-    async execute(params, _ctx) {
+    async execute(params) {
       try {
         const salt = randomBytes(16);
-        const { key, iv } = deriveKeyAndIv(params.password as string, salt);
+        const { key, iv } = deriveKeyAndIv(String(params.password ?? ''), salt);
         const cipher = createCipheriv('aes-256-cbc', key, iv);
         const encrypted = Buffer.concat([
-          cipher.update(Buffer.from(params.text as string, 'utf8')),
+          cipher.update(Buffer.from(String(params.text ?? ''), 'utf8')),
           cipher.final(),
         ]);
-        // Payload layout: salt(16) + iv(16) + ciphertext
         return { text: Buffer.concat([salt, iv, encrypted]).toString('base64') };
-      } catch (err: any) {
-        return { error: 'Encryption failed: ' + err.message };
+      } catch (err) {
+        return { error: `Encryption failed: ${(err as Error).message}` };
       }
     },
   },
@@ -161,19 +159,19 @@ export const securityActions: Action[] = [
       { name: 'encrypted', type: 'string', required: true, description: 'Base64 ciphertext' },
       { name: 'password',  type: 'string', required: true, description: 'Decryption password' },
     ],
-    async execute(params, _ctx) {
+    async execute(params) {
       try {
-        const payload = Buffer.from(params.encrypted as string, 'base64');
+        const payload = Buffer.from(String(params.encrypted ?? ''), 'base64');
         if (payload.length < 33) return { error: 'Invalid ciphertext: too short' };
         const salt      = payload.subarray(0, 16);
         const iv        = payload.subarray(16, 32);
         const encrypted = payload.subarray(32);
-        const { key } = deriveKeyAndIv(params.password as string, salt);
+        const { key } = deriveKeyAndIv(String(params.password ?? ''), salt);
         const decipher = createDecipheriv('aes-256-cbc', key, iv);
         const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
         return { text: decrypted.toString('utf8') };
-      } catch (err: any) {
-        return { error: 'Decryption failed: ' + err.message };
+      } catch (err) {
+        return { error: `Decryption failed: ${(err as Error).message}` };
       }
     },
   },
@@ -185,22 +183,16 @@ export const securityActions: Action[] = [
     description: 'Compute a cryptographic hash of a text string',
     params: [
       { name: 'text', type: 'string', required: true, description: 'Text to hash' },
-      {
-        name: 'algorithm',
-        type: 'string',
-        required: false,
-        description: 'Hash algorithm',
-        enum: ['md5', 'sha1', 'sha256', 'sha512'],
-        default: 'sha256',
-      },
+      { name: 'algorithm', type: 'string', required: false, description: 'Hash algorithm', enum: ['md5', 'sha1', 'sha256', 'sha512'], default: 'sha256' },
     ],
-    async execute(params, _ctx) {
+    async execute(params) {
       try {
-        const algo = (params.algorithm as string) ?? 'sha256';
-        const hash = createHash(algo).update(params.text as string, 'utf8').digest('hex');
-        return { text: algo.toUpperCase() + ': ' + hash };
-      } catch (err: any) {
-        return { error: 'Hash failed: ' + err.message };
+        const algo = String(params.algorithm ?? 'sha256');
+        if (!['md5', 'sha1', 'sha256', 'sha512'].includes(algo)) return { error: `Unsupported algorithm: ${algo}` };
+        const hash = createHash(algo).update(String(params.text ?? ''), 'utf8').digest('hex');
+        return { text: `${algo.toUpperCase()}: ${hash}` };
+      } catch (err) {
+        return { error: `Hash failed: ${(err as Error).message}` };
       }
     },
   },
@@ -212,29 +204,22 @@ export const securityActions: Action[] = [
     description: 'Verify that the input file matches an expected checksum',
     params: [
       { name: 'expected', type: 'string', required: true, description: 'Expected hash (hex)' },
-      {
-        name: 'algorithm',
-        type: 'string',
-        required: false,
-        description: 'Hash algorithm',
-        enum: ['md5', 'sha1', 'sha256'],
-        default: 'sha256',
-      },
+      { name: 'algorithm', type: 'string', required: false, description: 'Hash algorithm', enum: ['md5', 'sha1', 'sha256'], default: 'sha256' },
     ],
     async execute(params, ctx) {
       try {
         if (ctx.inputFiles.length === 0) return { error: 'No input file provided' };
-        const algo = (params.algorithm as string) ?? 'sha256';
+        const algo = String(params.algorithm ?? 'sha256');
+        if (!['md5', 'sha1', 'sha256'].includes(algo)) return { error: `Unsupported algorithm: ${algo}` };
         const data = await readFile(ctx.inputFiles[0]);
         const actual = createHash(algo).update(data).digest('hex');
-        const expected = (params.expected as string).toLowerCase().trim();
+        const expected = String(params.expected ?? '').toLowerCase().trim();
         const match = actual === expected;
         return {
-          text: (match ? 'MATCH' : 'MISMATCH') + '\n' +
-                'Expected: ' + expected + '\nActual:   ' + actual,
+          text: `${match ? 'MATCH' : 'MISMATCH'}\nExpected: ${expected}\nActual:   ${actual}`,
         };
-      } catch (err: any) {
-        return { error: 'Checksum verification failed: ' + err.message };
+      } catch (err) {
+        return { error: `Checksum verification failed: ${(err as Error).message}` };
       }
     },
   },
@@ -257,11 +242,10 @@ export const securityActions: Action[] = [
           },
         });
         const outFile = ctx.outputPath('sanitized.html');
-        const { writeFile } = await import('node:fs/promises');
         await writeFile(outFile, clean, 'utf8');
         return { files: [outFile], text: 'HTML sanitized. Removed unsafe tags and attributes.' };
-      } catch (err: any) {
-        return { error: 'HTML sanitization failed: ' + err.message };
+      } catch (err) {
+        return { error: `HTML sanitization failed: ${(err as Error).message}` };
       }
     },
   },
@@ -274,16 +258,13 @@ export const securityActions: Action[] = [
     params: [
       { name: 'email', type: 'string', required: true, description: 'Email address to validate' },
     ],
-    async execute(params, _ctx) {
+    async execute(params) {
       try {
-        const email = (params.email as string).trim();
+        const email = String(params.email ?? '').trim();
         const valid = isValidEmail(email);
-        return {
-          text: (valid ? 'VALID' : 'INVALID') + ': "' + email + '" ' +
-                (valid ? 'is a valid email format.' : 'is not a valid email format.'),
-        };
-      } catch (err: any) {
-        return { error: 'Email validation failed: ' + err.message };
+        return { text: `${valid ? 'VALID' : 'INVALID'}: "${email}" ${valid ? 'is a valid email format.' : 'is not a valid email format.'}` };
+      } catch (err) {
+        return { error: `Email validation failed: ${(err as Error).message}` };
       }
     },
   },
@@ -296,30 +277,18 @@ export const securityActions: Action[] = [
     params: [],
     async execute(params, ctx) {
       try {
-        const { generateKeyPairSync } = await import('node:crypto');
-        const { publicKey, privateKey } = generateKeyPairSync('rsa', {
+        const { publicKey, privateKey } = await generateKeyPairAsync('rsa', {
           modulusLength: 2048,
           publicKeyEncoding:  { type: 'spki',  format: 'pem' },
           privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
         });
         const pubFile  = ctx.outputPath('public_key.pem');
         const privFile = ctx.outputPath('private_key.pem');
-        const { writeFile } = await import('node:fs/promises');
-        await writeFile(pubFile,  publicKey,  'utf8');
-        await writeFile(privFile, privateKey, 'utf8');
-        return { files: [pubFile, privFile], text: 'RSA-2048 key pair generated.\n\nPublic Key:\n' + publicKey };
-      } catch (err: any) {
-        // Fallback to openssl CLI
-        try {
-          const privFile = ctx.outputPath('private_key.pem');
-          const pubFile  = ctx.outputPath('public_key.pem');
-          await ctx.exec('openssl genrsa -out "' + escPath(privFile) + '" 2048', 30000);
-          await ctx.exec('openssl rsa -in "' + escPath(privFile) + '" -pubout -out "' + escPath(pubFile) + '"', 15000);
-          const pub = await readFile(pubFile, 'utf8');
-          return { files: [pubFile, privFile], text: 'RSA-2048 key pair generated (openssl).\n\nPublic Key:\n' + pub };
-        } catch (fallback: any) {
-          return { error: 'Key pair generation failed: ' + err.message + '; openssl: ' + fallback.message };
-        }
+        await writeFile(pubFile, publicKey as string, 'utf8');
+        await writeFile(privFile, privateKey as string, 'utf8');
+        return { files: [pubFile, privFile], text: `RSA-2048 key pair generated.\n\nPublic Key:\n${publicKey}` };
+      } catch (err) {
+        return { error: `Key pair generation failed: ${(err as Error).message}` };
       }
     },
   },
@@ -328,21 +297,22 @@ export const securityActions: Action[] = [
     id: 'security.cert_info',
     category: 'security',
     name: 'Certificate Info',
-    description: 'Show TLS certificate details for a domain using openssl',
+    description: 'Show TLS certificate details for a domain using openssl s_client',
     params: [
       { name: 'domain', type: 'string', required: true, description: 'Domain to inspect (e.g. example.com)' },
     ],
     async execute(params, ctx) {
       try {
-        const domain = params.domain as string;
-        const info = await ctx.exec(
-          'echo "" | openssl s_client -connect "' + domain + ':443" -servername "' + domain +
-          '" 2>/dev/null | openssl x509 -noout -text 2>&1',
-          25000,
-        );
+        const domain = assertValidDomain(String(params.domain ?? ''));
+        const info = await ctx.runArgs('openssl', [
+          's_client',
+          '-connect', `${domain}:443`,
+          '-servername', domain,
+          '-showcerts',
+        ], { timeout: 25_000 }).catch(err => `${(err as Error).message}`);
         return { text: info };
-      } catch (err: any) {
-        return { error: 'Certificate info failed: ' + err.message };
+      } catch (err) {
+        return { error: `Certificate info failed: ${(err as Error).message}` };
       }
     },
   },

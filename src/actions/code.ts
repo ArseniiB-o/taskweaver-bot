@@ -1,7 +1,5 @@
 import type { Action } from './types.js';
-import { escPath } from '../utils.js';
 import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -499,9 +497,12 @@ export const codeActions: Action[] = [
     execute: async (params, ctx) => {
       try {
         if (ctx.inputFiles.length < 2) return { error: 'Two input files are required' };
-        const a = escPath(ctx.inputFiles[0]);
-        const b = escPath(ctx.inputFiles[1]);
-        const result = await ctx.exec(`diff -u ${a} ${b} || true`);
+        let result = '';
+        try {
+          result = await ctx.runArgs('diff', ['-u', ctx.inputFiles[0], ctx.inputFiles[1]]);
+        } catch (e) {
+          result = (e as Error).message ?? '';
+        }
         return { text: result || '(no differences)' };
       } catch (err) {
         return { error: `diff failed: ${(err as Error).message}` };

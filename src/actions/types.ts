@@ -13,12 +13,18 @@ export interface ActionResult {
   error?: string;
 }
 
+export interface ExecRunOptions {
+  timeout?: number;
+  maxBuffer?: number;
+}
+
 export interface ExecContext {
   workDir: string;
   inputFiles: string[];
+  jobId: string;
+  abortSignal?: AbortSignal;
   outputPath: (filename: string) => string;
-  exec: (cmd: string, timeout?: number) => Promise<string>;
-  run: (cmd: string, timeout?: number) => Promise<string>;
+  runArgs: (command: string, args: string[], options?: ExecRunOptions) => Promise<string>;
   log: (msg: string) => void;
 }
 
@@ -28,13 +34,13 @@ export interface Action {
   name: string;
   description: string;
   params: ParamDef[];
-  execute: (params: Record<string, any>, ctx: ExecContext) => Promise<ActionResult>;
+  execute: (params: Record<string, unknown>, ctx: ExecContext) => Promise<ActionResult>;
 }
 
 export interface PlannedStep {
   action: string;
-  params: Record<string, any>;
-  useOutputFrom?: number;
+  params: Record<string, unknown>;
+  useOutputFrom?: number | null;
 }
 
 export interface ExecutionPlan {
